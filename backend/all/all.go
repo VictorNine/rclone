@@ -28,6 +28,7 @@ import (
 	_ "github.com/rclone/rclone/backend/opendrive"
 	_ "github.com/rclone/rclone/backend/pcloud"
 	_ "github.com/rclone/rclone/backend/premiumizeme"
+	_ "github.com/rclone/rclone/backend/pubcrypt"
 	_ "github.com/rclone/rclone/backend/putio"
 	_ "github.com/rclone/rclone/backend/qingstor"
 	_ "github.com/rclone/rclone/backend/s3"
