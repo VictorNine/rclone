@@ -6,6 +6,9 @@ import (
 	"crypto/aes"
 	gocipher "crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base32"
 	"fmt"
 	"io"
@@ -29,7 +32,8 @@ const (
 	fileMagic           = "RCLONE\x00\x00"
 	fileMagicSize       = len(fileMagic)
 	fileNonceSize       = 24
-	fileHeaderSize      = fileMagicSize + fileNonceSize
+	fileSessionKeySize  = 128
+	fileHeaderSize      = fileMagicSize + fileNonceSize + fileSessionKeySize
 	blockHeaderSize     = secretbox.Overhead
 	blockDataSize       = 64 * 1024
 	blockSize           = blockHeaderSize + blockDataSize
@@ -114,7 +118,6 @@ func (mode NameEncryptionMode) String() (out string) {
 
 // Cipher defines an encoding and decoding cipher for the crypt backend
 type Cipher struct {
-	dataKey        [32]byte                  // Key for secretbox
 	nameKey        [32]byte                  // 16,24 or 32 bytes
 	nameTweak      [nameCipherBlockSize]byte // used to tweak the name crypto
 	block          gocipher.Block
@@ -122,10 +125,12 @@ type Cipher struct {
 	buffers        sync.Pool // encrypt/decrypt buffers
 	cryptoRand     io.Reader // read crypto random numbers from here
 	dirNameEncrypt bool
+	privateKey     *rsa.PrivateKey
+	publicKey      *rsa.PublicKey
 }
 
 // newCipher initialises the cipher.  If salt is "" then it uses a built in salt val
-func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bool) (*Cipher, error) {
+func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bool, privateKeyStr, publicKeyStr string) (*Cipher, error) {
 	c := &Cipher{
 		mode:           mode,
 		cryptoRand:     rand.Reader,
@@ -138,6 +143,20 @@ func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bo
 	if err != nil {
 		return nil, err
 	}
+
+	// If no key is provided ignore it and just use public key (only encryption)
+	if privateKeyStr != "" {
+		c.privateKey, c.publicKey, err = keyPairFromStr(privateKeyStr)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		c.publicKey, err = publicKeyFromStr(publicKeyStr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return c, nil
 }
 
@@ -150,7 +169,7 @@ func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bo
 // Note that empty password makes all 0x00 keys which is used in the
 // tests.
 func (c *Cipher) Key(password, salt string) (err error) {
-	const keySize = len(c.dataKey) + len(c.nameKey) + len(c.nameTweak)
+	const keySize = len(c.nameKey) + len(c.nameTweak)
 	var saltBytes = defaultSalt
 	if salt != "" {
 		saltBytes = []byte(salt)
@@ -164,9 +183,8 @@ func (c *Cipher) Key(password, salt string) (err error) {
 			return err
 		}
 	}
-	copy(c.dataKey[:], key)
-	copy(c.nameKey[:], key[len(c.dataKey):])
-	copy(c.nameTweak[:], key[len(c.dataKey)+len(c.nameKey):])
+	copy(c.nameKey[:], key)
+	copy(c.nameTweak[:], key[len(c.nameKey):])
 	// Key the name cipher
 	c.block, err = aes.NewCipher(c.nameKey[:])
 	return err
@@ -575,17 +593,46 @@ func (n *nonce) add(x uint64) {
 	}
 }
 
+func publicKeyFromStr(key string) (*rsa.PublicKey, error) {
+	decoded, err := base32.StdEncoding.DecodeString(key)
+	if err != nil {
+		panic(err)
+	}
+
+	publicKey, err := x509.ParsePKCS1PublicKey(decoded)
+	return publicKey, err
+}
+
+func (c *Cipher) createSessionKey() ([32]byte, []byte, error) {
+	// Create random session key
+	var sessionKey [32]byte
+	var encSessionKey []byte
+
+	n, err := io.ReadFull(c.cryptoRand, sessionKey[:])
+	if n != 32 {
+		return sessionKey, encSessionKey, errors.New("short read of session key")
+	}
+	if err != nil {
+		return sessionKey, encSessionKey, err
+	}
+
+	encSessionKey, err = rsa.EncryptOAEP(sha256.New(), c.cryptoRand, c.publicKey, sessionKey[:], nil)
+
+	return sessionKey, encSessionKey, err
+}
+
 // encrypter encrypts an io.Reader on the fly
 type encrypter struct {
-	mu       sync.Mutex
-	in       io.Reader
-	c        *Cipher
-	nonce    nonce
-	buf      []byte
-	readBuf  []byte
-	bufIndex int
-	bufSize  int
-	err      error
+	mu         sync.Mutex
+	in         io.Reader
+	c          *Cipher
+	nonce      nonce
+	sessionKey [32]byte // Key for secretbox
+	buf        []byte
+	readBuf    []byte
+	bufIndex   int
+	bufSize    int
+	err        error
 }
 
 // newEncrypter creates a new file handle encrypting on the fly
@@ -610,6 +657,17 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 	copy(fh.buf, fileMagicBytes)
 	// Copy nonce into buffer
 	copy(fh.buf[fileMagicSize:], fh.nonce[:])
+
+	sessionKey, encSessionKey, err := c.createSessionKey()
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy encrypted session key to file header
+	copy(fh.buf[fileMagicSize+fileNonceSize:], encSessionKey)
+
+	fh.sessionKey = sessionKey
+
 	return fh, nil
 }
 
@@ -634,7 +692,7 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 		// possibly err != nil here, but we will process the
 		// data and the next call to ReadFull will return 0, err
 		// Encrypt the block using the nonce
-		secretbox.Seal(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+		secretbox.Seal(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.sessionKey)
 		fh.bufIndex = 0
 		fh.bufSize = blockHeaderSize + n
 		fh.nonce.increment()
@@ -673,11 +731,35 @@ func (c *Cipher) EncryptData(in io.Reader) (io.Reader, error) {
 	return out, err
 }
 
+func keyPairFromStr(key string) (*rsa.PrivateKey, *rsa.PublicKey, error) {
+	decoded, err := base32.StdEncoding.DecodeString(key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	privateKey, err := x509.ParsePKCS1PrivateKey(decoded)
+	return privateKey, &privateKey.PublicKey, err
+}
+
+func (c *Cipher) decryptSessionKey(encKey []byte) ([32]byte, error) {
+	if c.privateKey == nil {
+		return [32]byte{}, errors.New("You need a private key to decrypt")
+	}
+
+	decrypted, err := rsa.DecryptOAEP(sha256.New(), c.cryptoRand, c.privateKey, encKey, nil)
+
+	var sessionKey [32]byte
+	copy(sessionKey[:], decrypted)
+
+	return sessionKey, err
+}
+
 // decrypter decrypts an io.ReaderCloser on the fly
 type decrypter struct {
 	mu           sync.Mutex
 	rc           io.ReadCloser
 	nonce        nonce
+	sessionKey   [32]byte // Key for secretbox
 	initialNonce nonce
 	c            *Cipher
 	buf          []byte
@@ -712,8 +794,21 @@ func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
 		return nil, fh.finishAndClose(ErrorEncryptedBadMagic)
 	}
 	// retrieve the nonce
-	fh.nonce.fromBuf(readBuf[fileMagicSize:])
+	fh.nonce.fromBuf(readBuf[fileMagicSize : fileMagicSize+fileNonceSize])
 	fh.initialNonce = fh.nonce
+
+	// retrieve session key
+	var encSessionKey []byte
+	encSessionKey = readBuf[fileMagicSize+fileNonceSize:]
+
+	// Decrypt session key
+	sessionKey, err := c.decryptSessionKey(encSessionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	fh.sessionKey = sessionKey
+
 	return fh, nil
 }
 
@@ -779,7 +874,7 @@ func (fh *decrypter) fillBuffer() (err error) {
 		return ErrorEncryptedFileBadHeader
 	}
 	// Decrypt the block using the nonce
-	_, ok := secretbox.Open(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+	_, ok := secretbox.Open(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.sessionKey)
 	if !ok {
 		if err != nil {
 			return err // return pending error as it is likely more accurate

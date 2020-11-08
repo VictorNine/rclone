@@ -939,6 +939,40 @@ func matchProvider(providerConfig, provider string) bool {
 func ChooseOption(o *fs.Option, name string) string {
 	var subProvider = getConfigData().MustValue(name, fs.ConfigProvider, "")
 	fmt.Println(o.Help)
+
+	if o.IsKey {
+		actions := []string{"yYes type in my own key", "gGenerate random key"}
+		defaultAction := -1
+		if !o.Required {
+			defaultAction = len(actions)
+			actions = append(actions, "nNo leave this optional field blank")
+		}
+		var privKey string
+		var err error
+		switch i := CommandDefault(actions, defaultAction); i {
+		case 'y':
+			fmt.Printf("Enter private key: ")
+			privKey = ReadLine()
+		case 'g':
+			for {
+				privKey, err = random.KeyPair()
+				if err != nil {
+					log.Fatalf("Failed to make keys: %v", err)
+				}
+				fmt.Printf("Your new private key  is: %s\n", privKey)
+				fmt.Printf("Use this key?\n")
+				if Confirm(true) {
+					break
+				}
+			}
+		case 'n':
+			return ""
+		default:
+			fs.Errorf(nil, "Bad choice %c", i)
+		}
+		return privKey
+	}
+
 	if o.IsPassword {
 		actions := []string{"yYes type in my own password", "gGenerate random password"}
 		defaultAction := -1

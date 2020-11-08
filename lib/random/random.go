@@ -5,6 +5,11 @@ import (
 	"encoding/base64"
 	"math/rand"
 
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base32"
+
 	"github.com/pkg/errors"
 )
 
@@ -50,4 +55,15 @@ func Password(bits int) (password string, err error) {
 	}
 	password = base64.RawURLEncoding.EncodeToString(pw)
 	return password, nil
+}
+
+func KeyPair() (privKey string, err error) {
+	privateKey, err := rsa.GenerateKey(crand.Reader, 1024)
+	if err != nil {
+		return "", err
+	}
+
+	private := x509.MarshalPKCS1PrivateKey(privateKey)
+
+	return base32.StdEncoding.EncodeToString(private), nil
 }

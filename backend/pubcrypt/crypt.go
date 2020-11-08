@@ -66,13 +66,20 @@ NB If filename_encryption is "off" then this option will do nothing.`,
 			},
 		}, {
 			Name:       "password",
-			Help:       "Password or pass phrase for encryption.",
+			Help:       "Password or pass phrase for encryption of filenames only.",
 			IsPassword: true,
 			Required:   true,
 		}, {
 			Name:       "password2",
-			Help:       "Password or pass phrase for salt. Optional but recommended.\nShould be different to the previous password.",
+			Help:       "Password or pass phrase for salt. Optional but recommended.\nShould be different to the previous password.\nOnly used for filenames.",
 			IsPassword: true,
+		}, {
+			Name:  "private_key",
+			Help:  "Private key used to decrypt files. If you only need encryption leave blank.",
+			IsKey: true,
+		}, {
+			Name: "public_key",
+			Help: "The public key used to encrypt files. If you have entered/generated a private key leave this blank.",
 		}, {
 			Name:    "server_side_across_configs",
 			Default: false,
@@ -125,7 +132,10 @@ func newCipherForConfig(opt *Options) (*Cipher, error) {
 			return nil, errors.Wrap(err, "failed to decrypt password2")
 		}
 	}
-	cipher, err := newCipher(mode, password, salt, opt.DirectoryNameEncryption)
+
+	// TODO: Implement obscure for privatekey (like isPassword above)
+
+	cipher, err := newCipher(mode, password, salt, opt.DirectoryNameEncryption, opt.PrivateKey, opt.PublicKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to make cipher")
 	}
@@ -213,6 +223,8 @@ type Options struct {
 	Password2               string `config:"password2"`
 	ServerSideAcrossConfigs bool   `config:"server_side_across_configs"`
 	ShowMapping             bool   `config:"show_mapping"`
+	PrivateKey              string `config:"private_key"`
+	PublicKey               string `config:"public_key"`
 }
 
 // Fs represents a wrapped fs.Fs

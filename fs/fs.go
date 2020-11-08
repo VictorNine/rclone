@@ -149,6 +149,7 @@ type Option struct {
 	IsPassword bool             // set if the option is a password
 	NoPrefix   bool             // set if the option for this should not use the backend prefix
 	Advanced   bool             // set if this is an advanced config option
+	IsKey      bool             // set if the option is a private/public key
 }
 
 // BaseOption is an alias for Option used internally
